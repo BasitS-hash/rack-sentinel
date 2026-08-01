@@ -137,13 +137,16 @@ func Fleet(ctx context.Context, targets []Target, opts Options) ([]HostTelemetry
 
 // httpClientFor builds an HTTP client owned exclusively by one BMC connection.
 //
-// This is not merely tidy — it is required for correctness under concurrency.
-// When gofish is left to build its own client it copies TLSClientConfig *by
-// pointer* from http.DefaultTransport and sets ForceAttemptHTTP2, so every
-// client it creates ends up sharing one *tls.Config. Go's HTTP/2 setup then
-// mutates that shared config (appending to NextProtos) from each transport,
-// which races when clients are created in parallel — precisely what fleet
-// polling does. Supplying a client with its own tls.Config removes the sharing.
+// This is not merely tidy — without it, `go test -race` fails.
+//
+// Creating many http.Transports concurrently with ForceAttemptHTTP2 and a nil
+// TLSClientConfig races inside the standard library, in
+// Transport.onceSetNextProtoDefaults -> http2configureTransports (read at
+// h2_bundle.go:7539, write at transport.go:461 on Go 1.26.5). Constructing the
+// tls.Config explicitly avoids it.
+//
+// This is NOT a gofish bug, despite gofish being where the stack trace surfaces:
+// the identical race reproduces with plain net/http and no gofish involved.
 //
 // It also gives each host an isolated connection pool, so one slow BMC cannot
 // occupy connections another host is waiting on.

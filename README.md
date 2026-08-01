@@ -75,20 +75,35 @@ that look exactly like hardware faults.
 **State writes are atomic.** A truncated state file loses every trend the fleet has
 accumulated, so saves go to a temp file and are renamed into place.
 
-## A data race in the upstream client
+## A data race when configuring many transports concurrently
 
-`rack-sentinel` builds its own `*http.Client` per BMC rather than letting gofish
-build one. That is not stylistic.
+`rack-sentinel` builds its own `*http.Client`, with an explicitly non-nil
+`TLSClientConfig`, per BMC. That is not stylistic — without it, `go test -race`
+fails.
 
-When `gofish.ClientConfig.HTTPClient` is nil, gofish creates a fresh `http.Transport`
-but copies `TLSClientConfig` **by pointer** from `http.DefaultTransport`, then sets
-`ForceAttemptHTTP2: true`. Every client it creates therefore shares one `*tls.Config`,
-and Go's HTTP/2 setup mutates that shared config during transport configuration. Creating
-clients in parallel — which is the entire point of a Redfish library — races.
+Creating many `http.Transport`s concurrently with `ForceAttemptHTTP2: true` and a
+nil `TLSClientConfig` races inside the standard library, in
+`Transport.onceSetNextProtoDefaults` → `http2configureTransports`:
 
-Reproduced with `go test -race` against a local Redfish mock; the trace lands in
-`net/http.http2configureTransports`. Supplying a client with its own `tls.Config`
-removes the sharing. This is being written up for upstream.
+```
+Read at  net/http.http2configureTransports   h2_bundle.go:7539
+Write at net/http.(*Transport).onceSetNextProtoDefaults  transport.go:461
+```
+
+**This is not a bug in gofish.** The first version of this README said it was —
+gofish copies `TLSClientConfig` from `http.DefaultTransport` and sets
+`ForceAttemptHTTP2`, which looked like the cause. It is not: `DefaultTransport`'s
+`TLSClientConfig` is nil, and `http2configureTransports` gives each transport its
+own `new(tls.Config)`. Reproducing the same pattern with **plain `net/http` and no
+gofish at all** produces an identical race signature, on Go 1.26.5.
+
+Giving each transport an explicitly-constructed `tls.Config` avoids it. Whether the
+underlying stdlib behaviour is a Go bug or intended is not something this project
+claims to have established.
+
+*Lesson recorded here because it was nearly published as an upstream bug report: a
+plausible root cause that fits the stack trace is still a guess until the
+counterfactual is tested.*
 
 ## Benchmarks
 
