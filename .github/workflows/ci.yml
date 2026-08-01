@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24', '1.25']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=2 ./...
+
+      - name: Coverage floor on the analysis engine
+        run: |
+          set -euo pipefail
+          go test -coverprofile=cover.out ./internal/... >/dev/null
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "internal/ coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 80.0) ? 0 : 1 }' \
+            || { echo "coverage ${pct}% is below the 80% floor"; exit 1; }
+
+      - name: Benchmarks compile and run
+        run: go test -bench=. -benchtime=1x -run=XXX ./...
+
+      - name: Build
+        run: go build ./...

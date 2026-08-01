@@ -1,0 +1,5 @@
+.venv/
+rack-sentinel
+*.tmp
+state.json
+.DS_Store
