@@ -64,6 +64,14 @@ type ECCTrend struct {
 	Samples int
 }
 
+// Trendable reports whether the epoch carries enough evidence for RatePerHour
+// and Acceleration to mean anything. Output formats that export the numbers
+// rather than the prose have to ask the same question AnalyzeECC asks, or they
+// publish a rate it refused to claim.
+func (t ECCTrend) Trendable() bool {
+	return t.Samples >= minSamplesForTrend && t.Span >= minSpanForTrend
+}
+
 // AnalyzeECC evaluates a correctable-error counter for predictive signal.
 //
 // Correctable errors are, by definition, errors the memory subsystem handled.
@@ -92,7 +100,7 @@ func AnalyzeECC(host string, s Series) (ECCTrend, *Finding) {
 		return trend, nil
 	}
 
-	if len(epoch) < minSamplesForTrend || trend.Span < minSpanForTrend {
+	if !trend.Trendable() {
 		// Not enough evidence to claim a rate. Say so rather than inventing one:
 		// a scary-looking extrapolation from three points in five minutes is how
 		// operators learn to ignore a tool.
@@ -214,15 +222,21 @@ func currentEpoch(samples []Sample) ([]Sample, int) {
 	if len(samples) == 0 {
 		return nil, 0
 	}
+	start, resets := epochStart(samples)
+	return samples[start:], resets
+}
 
-	start, resets := 0, 0
+// epochStart returns the index of the first sample in the latest epoch, plus the
+// number of resets seen across the whole series. Retention needs the index on
+// its own, and there must be exactly one definition of where an epoch begins.
+func epochStart(samples []Sample) (start, resets int) {
 	for i := 1; i < len(samples); i++ {
 		if samples[i].Value < samples[i-1].Value {
 			resets++
 			start = i
 		}
 	}
-	return samples[start:], resets
+	return start, resets
 }
 
 // leastSquaresPerHour fits value against time and returns the slope in units per

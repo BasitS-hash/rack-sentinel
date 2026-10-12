@@ -73,12 +73,24 @@ type Finding struct {
 	Confidence float64
 }
 
+// HostTrend is one component's trend together with the host it belongs to.
+type HostTrend struct {
+	Host  string
+	Trend ECCTrend
+}
+
 // Report is the full result of analysing one fleet poll.
 type Report struct {
 	GeneratedAt time.Time
 	HostsPolled int
 	HostsFailed int
 	Findings    []Finding
+
+	// Trends carries the numbers behind the findings — and behind the counters
+	// that produced none — for output formats that export measurements rather
+	// than prose. It is excluded from the JSON report, whose shape is already a
+	// contract with whatever is parsing it.
+	Trends []HostTrend `json:"-"`
 }
 
 // Worst returns the highest severity present, or SeverityInfo when clean.

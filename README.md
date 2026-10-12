@@ -61,8 +61,12 @@ about A. That inversion is the whole point, and it is pinned by tests:
 **A counter the BMC did not report is absent, never zero.** Vendors populate
 Redfish memory metrics inconsistently; several expose only a health status. Coercing
 a missing counter to `0` would make a blind BMC indistinguishable from healthy
-hardware — the most dangerous possible failure mode for this tool. Pinned by
-`TestHost_UnreportedCounterIsAbsentNotZero`.
+hardware — the most dangerous possible failure mode for this tool. The same rule
+survives into the metrics output: a counter the BMC never returned has no series in
+the `.prom` file, and a rate the analysis refused to claim is not exported as
+`0.0`. Pinned by `TestHost_UnreportedCounterIsAbsentNotZero`,
+`TestWriteProm_OnlyCountersTheBMCReportedAppear` and
+`TestWriteProm_UncomputableRateIsAbsentNotZero`.
 
 **One dead BMC never hides the fleet.** Every target always yields a result;
 failures travel in the result rather than aborting the run. An unreachable BMC is
@@ -72,8 +76,21 @@ itself a finding — a node nobody can see is not a node that is fine.
 controllers with shallow connection queues; unbounded parallelism produces timeouts
 that look exactly like hardware faults.
 
+**Retention is a window on the analysis, not a cut on the file.** `-retain` drops
+samples outside the window, but two positions survive regardless of age: the sample
+on the high side of the latest counter reset, without which the epoch boundary and
+the reset count that discounts confidence both vanish, and enough of the epoch to
+stay trendable, without which a long history collapses into a 20%-confidence
+`insufficient-history` note. On the pinned fixture, a naive age-only cut moves the
+rate from 66.7 to 78.5 errors/hour, the acceleration from 16.6x to 13.6x and the
+confidence from 56% to 52% — same DIMM, different report. Pinned by
+`TestPrune_KeepsTheResetBoundaryAndTheVerdict` and
+`TestPrune_WillNotStarveATrendableSeries`.
+
 **State writes are atomic.** A truncated state file loses every trend the fleet has
-accumulated, so saves go to a temp file and are renamed into place.
+accumulated, so saves go to a temp file and are renamed into place. The metrics file
+gets the same treatment for a different reason: node_exporter reads it on its own
+schedule, and a half-written file is a parse error that discards the whole scrape.
 
 ## A data race when configuring many transports concurrently
 
@@ -111,7 +128,7 @@ counterfactual is tested.*
 
 | benchmark | scale | time | allocs |
 |---|---|---|---|
-| `HistoryAnalyze` | 500 hosts × 16 DIMMs = **8,000 series**, 96 samples each | **15.5 ms** | 66,839 |
+| `HistoryAnalyze` | 500 hosts × 16 DIMMs = **8,000 series**, 96 samples each | **16.6 ms** | 66,841 |
 | `AnalyzeECC` | one week of 1-minute samples (10,080 points) | 309 µs | 17 |
 | `LeastSquaresPerHour` | 10,000 points | 147 µs | **0** |
 
@@ -124,7 +141,8 @@ are the tunable knobs.
 ```bash
 go build ./cmd/rack-sentinel
 
-rack-sentinel -targets fleet.csv -history state.json [-insecure] [-json]
+rack-sentinel -targets fleet.csv -history state.json [-retain 336h] [-prom FILE]
+              [-insecure] [-json]
 ```
 
 `fleet.csv` is `host,endpoint,username,password`; `#` comments are skipped:
@@ -138,6 +156,43 @@ node-02,https://10.0.0.12,admin,secret
 **Trends need history.** Run it on a schedule with `-history` pointing at the same
 file. A single run can only report counters, not whether they are getting worse —
 the tool says so rather than pretending otherwise.
+
+`-retain` bounds that file. It defaults to two weeks, drops samples outside the
+window, and drops whole series for hosts and DIMMs nobody has polled inside it;
+without that, every host ever polled keeps its series forever and the cost of a poll
+grows with uptime. `-retain 0` keeps everything.
+
+### Prometheus
+
+`-prom` writes a file for node_exporter's textfile collector, replaced in a single
+rename so a scrape landing mid-write cannot read half of it:
+
+```bash
+rack-sentinel -targets fleet.csv -history state.json \
+  -prom /var/lib/node_exporter/textfile/rack-sentinel.prom
+```
+
+```
+rack_sentinel_ecc_correctable_errors_total{host="node-114",dimm="DIMM_B2"} 2914
+rack_sentinel_ecc_correctable_errors_per_hour{host="node-114",dimm="DIMM_B2"} 41.3
+rack_sentinel_ecc_acceleration_ratio{host="node-114",dimm="DIMM_B2"} 7.9
+rack_sentinel_finding_severity{host="node-114",component="DIMM_B2",kind="ecc.degrading"} 3
+rack_sentinel_finding_confidence_ratio{host="node-114",component="DIMM_B2",kind="ecc.degrading",severity="URGENT"} 0.94
+rack_sentinel_bmc_unreachable{host="node-207"} 1
+```
+
+The metrics file ignores `-min-severity`: deciding what deserves a page is
+Prometheus's job once the numbers are in it. `rack_sentinel_poll_timestamp_seconds`
+is exported so a cron that stopped running alerts on itself. Hosts that answered get
+no `rack_sentinel_bmc_unreachable` series at all — the fleet totals carry the
+denominator.
+
+One limit worth knowing before you alert on it: every sample is stamped at scrape
+time, because node_exporter rejects a textfile whose samples carry their own
+timestamps. So a host whose BMC did not answer this poll still exports its last
+known counters, looking as current as everything else. That is what
+`rack_sentinel_bmc_unreachable` is for — join on it before trusting a host's other
+series.
 
 Exit codes: `0` clean · `1` findings at or above `-min-severity` · `2` usage ·
 `3` could not run. Suitable as a cron or CI gate.
@@ -153,8 +208,12 @@ certificates, so this is usually required — but it is opt-in, not the default.
   already emits, and the alternative — flags — puts passwords in the process table
   where every user on the box can read them. A secrets-manager backend is the
   obvious next step.
-- **History is capped at 2,000 samples per counter** (~3 weeks at a 15-minute poll).
-  Trends care about shape, not archaeology.
+- **History is bounded two ways:** `-retain`, two weeks by default, and a hard cap
+  of 2,000 samples per counter. Trends care about shape, not archaeology. What
+  retention does not fix is width — 8,000 series is a large JSON file whichever
+  window it covers, and every run still reads and rewrites all of it. A fleet that
+  size wants the series in Prometheus rather than in this file, which is what
+  `-prom` is for.
 - **Tested against a Redfish mock, not against real BMC firmware.** Vendor
   implementations diverge; the pointer-vs-zero handling exists precisely because of
   that, but real iDRAC/iLO/XCC validation is not yet done and is the biggest gap.
@@ -165,9 +224,12 @@ certificates, so this is usually required — but it is opt-in, not the default.
 go test -race ./...
 ```
 
-Coverage: `internal/analyze` 91.6%, `internal/collect` 85.5%, `cmd` 50.6%. The CLI
-figure is honest — `run()` and the output formatting are not yet covered; the
-history and target-parsing logic under it is.
+Coverage: `internal/analyze` 93.9%, `internal/report` 92.5%, `internal/collect`
+85.5%, `internal/atomicfile` 66.7%, `cmd` 53.2%. Both low figures are honest rather
+than accidental: `run()` and the output formatting in `cmd` are not covered, though
+the history, retention and target-parsing logic under them is, and `atomicfile`'s
+write, sync, close and chmod failure branches need an injected filesystem to reach,
+which is not worth the indirection for forty lines.
 
 Collector tests run against a real `httptest` Redfish server rather than a stubbed
 client, because the vendor-inconsistency bugs live in the JSON decoding and pointer
