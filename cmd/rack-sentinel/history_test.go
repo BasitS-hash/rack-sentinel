@@ -380,3 +380,126 @@ func BenchmarkHistoryAnalyze(b *testing.B) {
 		h.analyze(nil)
 	}
 }
+
+// thermalPoll builds one telemetry result carrying a single sensor's margin.
+func thermalPoll(host string, at time.Time, margin float64) collect.HostTelemetry {
+	return collect.HostTelemetry{
+		Host:           host,
+		CollectedAt:    at,
+		ThermalMargins: map[string]float64{"CPU0_Die": margin},
+	}
+}
+
+func TestHistory_DetectsShrinkingMarginAcrossPolls(t *testing.T) {
+	// The same end-to-end claim as the ECC walk above, on the second signal: no
+	// single poll can tell you a node is losing cooling, because every poll sees
+	// a margin that is merely smaller than the threshold, which is normal.
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "state.json")
+
+	var report analyze.Report
+	for i := 0; i < 48; i++ {
+		h, err := loadHistory(path)
+		if err != nil {
+			t.Fatalf("poll %d: load: %v", i, err)
+		}
+		tele := []collect.HostTelemetry{
+			thermalPoll("node-1", start.Add(time.Duration(i)*time.Hour), 40-0.5*float64(i)),
+		}
+		h.append(tele)
+		report = h.analyze(tele)
+		if err := h.save(path); err != nil {
+			t.Fatalf("poll %d: save: %v", i, err)
+		}
+	}
+
+	var found *analyze.Finding
+	for i := range report.Findings {
+		if report.Findings[i].Kind == "thermal.margin-shrinking" {
+			found = &report.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no thermal finding after 48 polls: %+v", report.Findings)
+	}
+	if found.Severity != analyze.SeverityUrgent {
+		t.Errorf("severity = %s, want URGENT", found.Severity)
+	}
+	if found.Component != "CPU0_Die" {
+		t.Errorf("component = %q, want CPU0_Die", found.Component)
+	}
+
+	// The trend has to reach the exporter too, not only the prose.
+	if len(report.ThermalTrends) != 1 {
+		t.Fatalf("got %d thermal trends, want 1", len(report.ThermalTrends))
+	}
+	if report.ThermalTrends[0].Trend.ShrinkPerHour <= 0 {
+		t.Errorf("exported shrink rate = %.3f, want positive", report.ThermalTrends[0].Trend.ShrinkPerHour)
+	}
+}
+
+func TestHistory_SensorTheBMCStoppedReportingAddsNoSample(t *testing.T) {
+	// The absent-not-zero invariant where the series is built. A sensor that drops
+	// out of the BMC's response must not acquire a 0°C reading, which would read
+	// as a sensor sitting exactly on its critical threshold.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	h.append([]collect.HostTelemetry{thermalPoll("node-1", start, 30)})
+	h.append([]collect.HostTelemetry{{
+		Host: "node-1", CollectedAt: start.Add(time.Hour),
+		ThermalMargins: map[string]float64{}, // BMC answered, sensor gone
+	}})
+	h.append([]collect.HostTelemetry{thermalPoll("node-1", start.Add(2*time.Hour), 28)})
+
+	samples := h.Series["node-1"]["thermal.margin/CPU0_Die"]
+	if len(samples) != 2 {
+		t.Fatalf("got %d readings, want 2 — the poll that omitted the sensor must not contribute", len(samples))
+	}
+	for _, s := range samples {
+		if s.Value == 0 {
+			t.Error("an unreported sensor was recorded as 0°C of margin")
+		}
+	}
+}
+
+func TestHistory_ThermalSeriesGetGaugeRetention(t *testing.T) {
+	// The two series shapes land in the same file and must not be pruned by the
+	// same rule. A margin held to the ECC floor is trimmed below what the thermal
+	// analyser will speak about, and the sensor goes quiet.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 96; i++ {
+		at := start.Add(time.Duration(i) * time.Hour)
+		h.append([]collect.HostTelemetry{{
+			Host:              "node-1",
+			CollectedAt:       at,
+			CorrectableErrors: map[string]float64{"DIMM_A1": float64(10 * i)},
+			ThermalMargins:    map[string]float64{"CPU0_Die": 40 - 0.3*float64(i)},
+		}})
+	}
+	last := start.Add(95 * time.Hour)
+
+	// A window far shorter than what a thermal trend needs.
+	h.prune(last, 2*time.Hour)
+
+	margins := h.Series["node-1"]["thermal.margin/CPU0_Die"]
+	trend, f := analyze.AnalyzeThermal("node-1", analyze.Series{Component: "CPU0_Die", Samples: margins})
+	if !trend.Trendable() {
+		t.Errorf("retention left %d readings over %s — the sensor can no longer be trended",
+			trend.Samples, trend.Span)
+	}
+	if f == nil {
+		t.Error("retention silenced a sensor that is losing headroom")
+	}
+
+	// And the counter beside it still keeps its own floor, not the thermal one.
+	ecc := h.Series["node-1"]["ecc.correctable/DIMM_A1"]
+	if len(ecc) == 0 {
+		t.Fatal("the ECC series was deleted outright")
+	}
+	if len(ecc) >= len(margins) {
+		t.Errorf("the counter kept %d samples and the gauge %d; the counter's floor is the lower of the two",
+			len(ecc), len(margins))
+	}
+}

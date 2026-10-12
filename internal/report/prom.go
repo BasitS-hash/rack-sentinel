@@ -28,6 +28,10 @@ const (
 	mECCTotal       = "rack_sentinel_ecc_correctable_errors_total"
 	mECCRate        = "rack_sentinel_ecc_correctable_errors_per_hour"
 	mECCAccel       = "rack_sentinel_ecc_acceleration_ratio"
+	mThermalMargin  = "rack_sentinel_thermal_margin_celsius"
+	mThermalShrink  = "rack_sentinel_thermal_margin_shrink_celsius_per_hour"
+	mThermalAccel   = "rack_sentinel_thermal_shrink_acceleration_ratio"
+	mThermalHours   = "rack_sentinel_thermal_hours_to_critical"
 	mSeverity       = "rack_sentinel_finding_severity"
 	mConfidence     = "rack_sentinel_finding_confidence_ratio"
 )
@@ -80,6 +84,13 @@ func promText(r analyze.Report) []byte {
 			return trends[i].Host < trends[j].Host
 		}
 		return trends[i].Trend.Component < trends[j].Trend.Component
+	})
+	thermal := append([]analyze.HostThermalTrend(nil), r.ThermalTrends...)
+	sort.SliceStable(thermal, func(i, j int) bool {
+		if thermal[i].Host != thermal[j].Host {
+			return thermal[i].Host < thermal[j].Host
+		}
+		return thermal[i].Trend.Component < thermal[j].Trend.Component
 	})
 	findings := append([]analyze.Finding(nil), r.Findings...)
 	sort.SliceStable(findings, func(i, j int) bool {
@@ -143,6 +154,56 @@ func promText(r analyze.Report) []byte {
 			continue
 		}
 		sample(&b, mECCAccel, t.Trend.Acceleration, label{"host", t.Host}, label{"dimm", t.Trend.Component})
+	}
+
+	// The same absence rule as the counters above, and the inversion matters more
+	// here: 0 is not a neutral value for a margin, it is a sensor sitting exactly
+	// on the threshold the vendor said not to cross. A sensor the BMC stopped
+	// reporting must have no series at all.
+	declare(&b, mThermalMargin, "gauge",
+		"Degrees Celsius of headroom before this sensor's upper critical threshold; negative means exceeded. Sensors the BMC did not report are absent, not 0.")
+	for _, t := range thermal {
+		if t.Trend.Samples == 0 {
+			continue
+		}
+		sample(&b, mThermalMargin, t.Trend.Margin, label{"host", t.Host}, label{"sensor", t.Trend.Component})
+	}
+
+	declare(&b, mThermalShrink, "gauge",
+		"Degrees of headroom lost per hour, from the smoothed fit; positive means closing. Absent when the history is too short to trend.")
+	for _, t := range thermal {
+		if !t.Trend.Trendable() {
+			continue
+		}
+		sample(&b, mThermalShrink, t.Trend.ShrinkPerHour, label{"host", t.Host}, label{"sensor", t.Trend.Component})
+	}
+
+	declare(&b, mThermalAccel, "gauge",
+		"Recent-half shrink rate divided by the earlier-half rate; above 1 means the margin is closing faster than it was. Absent unless the margin is closing.")
+	for _, t := range thermal {
+		// Gated on the margin actually closing, not merely on the ratio being
+		// computable. On a sensor that is only swinging with load the earlier half
+		// is flat and the recent half happens to be rising, which the ratio
+		// reports as its 999 cap — a number nothing should be alerted on, and one
+		// that flips back next poll.
+		if !t.Trend.Trendable() || !t.Trend.Shrinking() || t.Trend.Acceleration == 0 {
+			continue
+		}
+		sample(&b, mThermalAccel, t.Trend.Acceleration, label{"host", t.Host}, label{"sensor", t.Trend.Component})
+	}
+
+	// Published only where the analysis would publish it. A crossing date is the
+	// number an operator plans around, so a fabricated one is worse than none:
+	// this is absent for a sensor whose readings no straight line described, even
+	// though dividing the margin by the slope would always produce a figure.
+	declare(&b, mThermalHours, "gauge",
+		"Projected hours until this sensor reaches upper critical at the current rate. Absent unless the margin is closing and the fit supports extrapolation.")
+	for _, t := range thermal {
+		hours, ok := t.Trend.HoursToCritical()
+		if !ok {
+			continue
+		}
+		sample(&b, mThermalHours, hours, label{"host", t.Host}, label{"sensor", t.Trend.Component})
 	}
 
 	declare(&b, mSeverity, "gauge",

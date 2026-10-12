@@ -37,19 +37,26 @@ func (s Severity) String() string {
 	}
 }
 
-// Sample is one observation of a monotonic counter at a point in time.
+// Sample is one observation of one measurement at a point in time.
 //
 // Counters from a BMC reset when the host power-cycles, so a decrease is not an
 // error — it is a new epoch. Callers must not assume the series is monotonic;
-// the analysis handles resets explicitly.
+// the analysis handles resets explicitly. A gauge, such as a thermal margin,
+// moves in both directions all day and has no epochs at all, which is why the
+// two are analysed and pruned by different rules.
 type Sample struct {
 	At    time.Time
 	Value float64
 }
 
-// Series is a time-ordered set of samples for one counter on one component.
+// Series is a time-ordered set of samples for one measurement on one component.
+//
+// The series does not say which of the two it is. That is the caller's business:
+// it knows whether it is handing over a counter or a gauge, and handing one to
+// the wrong analyser is a mistake no amount of inspection at this level could
+// catch — a falling counter and a falling margin look identical here.
 type Series struct {
-	// Component identifies the physical part, e.g. "DIMM_A1" or "Disk.Bay.3".
+	// Component identifies the physical part, e.g. "DIMM_A1" or "CPU0_Die".
 	Component string
 	Samples   []Sample
 }
@@ -73,10 +80,21 @@ type Finding struct {
 	Confidence float64
 }
 
-// HostTrend is one component's trend together with the host it belongs to.
+// HostTrend is one counter's trend together with the host it belongs to.
 type HostTrend struct {
 	Host  string
 	Trend ECCTrend
+}
+
+// HostThermalTrend is one sensor's margin trend together with its host.
+//
+// Separate from HostTrend rather than an interface over both: the two trends
+// share their reasoning, not their fields, and the exporter publishes different
+// metric families from each. A common interface would only move the type switch
+// somewhere less obvious.
+type HostThermalTrend struct {
+	Host  string
+	Trend ThermalTrend
 }
 
 // Report is the full result of analysing one fleet poll.
@@ -91,6 +109,10 @@ type Report struct {
 	// than prose. It is excluded from the JSON report, whose shape is already a
 	// contract with whatever is parsing it.
 	Trends []HostTrend `json:"-"`
+
+	// ThermalTrends carries the margin trends, for the same reason and with the
+	// same exclusion from the JSON report.
+	ThermalTrends []HostThermalTrend `json:"-"`
 }
 
 // Worst returns the highest severity present, or SeverityInfo when clean.
