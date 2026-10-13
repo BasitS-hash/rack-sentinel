@@ -31,6 +31,15 @@ const maxSamplesPerSeries = 2000
 // the rack fall out of the file inside a sprint.
 const defaultRetention = 14 * 24 * time.Hour
 
+// Series key prefixes. One file holds both signals, and the prefix is what says
+// which analyser and which retention rule a series belongs to — so it is
+// declared once rather than spelled out at each of the three places that reads
+// it.
+const (
+	keyECC           = "ecc.correctable/"
+	keyThermalMargin = "thermal.margin/"
+)
+
 // history is the persisted per-counter time series across runs.
 //
 // Keyed host -> component -> samples. Without it every run would see a single
@@ -93,9 +102,18 @@ func (h *history) append(telemetry []collect.HostTelemetry) {
 		}
 
 		for dimm, count := range t.CorrectableErrors {
-			key := "ecc.correctable/" + dimm
-			byComponent[key] = appendCapped(byComponent[key], analyze.Sample{
+			byComponent[keyECC+dimm] = appendCapped(byComponent[keyECC+dimm], analyze.Sample{
 				At: t.CollectedAt, Value: count,
+			})
+		}
+
+		// Only the sensors this BMC actually reported. A sensor absent from the
+		// map was not read as 0°C of margin — that would be a sensor sitting
+		// exactly on its critical threshold, which is the opposite condition.
+		for sensor, margin := range t.ThermalMargins {
+			key := keyThermalMargin + sensor
+			byComponent[key] = appendCapped(byComponent[key], analyze.Sample{
+				At: t.CollectedAt, Value: margin,
 			})
 		}
 	}
@@ -133,7 +151,16 @@ func (h *history) prune(now time.Time, retain time.Duration) {
 				delete(components, key)
 				continue
 			}
-			components[key] = analyze.Prune(samples, cutoff)
+			switch {
+			case strings.HasPrefix(key, keyECC):
+				components[key] = analyze.PruneCounter(samples, cutoff)
+			case strings.HasPrefix(key, keyThermalMargin):
+				components[key] = analyze.PruneGauge(samples, cutoff)
+			}
+			// A key this version does not recognise is left whole. It was written
+			// by a different build and trimming it by rules that may not apply to
+			// it is worse than carrying it — the stale-series check above still
+			// removes it once nothing is refreshing it.
 		}
 		if len(components) == 0 {
 			delete(h.Series, host)
@@ -179,6 +206,7 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 	// the numbers behind every series, not only the ones that produced a
 	// finding. Preallocated because at fleet scale this is one per DIMM.
 	report.Trends = make([]analyze.HostTrend, 0, series)
+	report.ThermalTrends = make([]analyze.HostThermalTrend, 0, series)
 
 	for _, host := range hosts {
 		components := h.Series[host]
@@ -189,15 +217,30 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 		sort.Strings(keys)
 
 		for _, key := range keys {
-			name, isECC := strings.CutPrefix(key, "ecc.correctable/")
-			if !isECC {
+			var finding *analyze.Finding
+
+			switch name, prefix := trimKey(key); prefix {
+			case keyECC:
+				trend, f := analyze.AnalyzeECC(host, analyze.Series{
+					Component: name,
+					Samples:   components[key],
+				})
+				report.Trends = append(report.Trends, analyze.HostTrend{Host: host, Trend: trend})
+				finding = f
+
+			case keyThermalMargin:
+				trend, f := analyze.AnalyzeThermal(host, analyze.Series{
+					Component: name,
+					Samples:   components[key],
+				})
+				report.ThermalTrends = append(report.ThermalTrends,
+					analyze.HostThermalTrend{Host: host, Trend: trend})
+				finding = f
+
+			default:
 				continue
 			}
-			trend, finding := analyze.AnalyzeECC(host, analyze.Series{
-				Component: name,
-				Samples:   components[key],
-			})
-			report.Trends = append(report.Trends, analyze.HostTrend{Host: host, Trend: trend})
+
 			if finding != nil {
 				report.Findings = append(report.Findings, *finding)
 			}
@@ -205,6 +248,17 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 	}
 
 	return report
+}
+
+// trimKey splits a series key into the component name and the prefix that says
+// what kind of measurement it is. An unrecognised key returns an empty prefix.
+func trimKey(key string) (name, prefix string) {
+	for _, p := range []string{keyECC, keyThermalMargin} {
+		if name, ok := strings.CutPrefix(key, p); ok {
+			return name, p
+		}
+	}
+	return "", ""
 }
 
 // save writes the state file atomically.

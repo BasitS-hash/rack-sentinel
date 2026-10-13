@@ -138,13 +138,16 @@ func AnalyzeECC(host string, s Series) (ECCTrend, *Finding) {
 	}
 
 	return trend, &Finding{
-		Host:       host,
-		Component:  s.Component,
-		Kind:       "ecc.degrading",
-		Severity:   sev,
-		Summary:    why,
-		Evidence:   ev,
-		Confidence: confidenceFor(trend),
+		Host:      host,
+		Component: s.Component,
+		Kind:      "ecc.degrading",
+		Severity:  sev,
+		Summary:   why,
+		Evidence:  ev,
+		Confidence: confidenceFor(fit{
+			Points: trend.Samples, RSquared: trend.RSquared,
+			Resets: trend.Resets, Span: trend.Span,
+		}),
 	}
 }
 
@@ -188,24 +191,39 @@ func gradeECC(t ECCTrend) (Severity, string) {
 	return SeverityInfo, ""
 }
 
+// fit is the evidence-quality side of a trend, as opposed to what the trend
+// says: how many points the slope rests on, how well a line described them, how
+// long they cover, and how many times the series discontinued.
+//
+// Both analysers produce one and both are scored by confidenceFor below. A
+// second confidence scale would mean an operator could not compare a thermal
+// finding at 60% with an ECC finding at 80%, which is most of what the number is
+// for.
+type fit struct {
+	Points   int
+	RSquared float64
+	Resets   int
+	Span     time.Duration
+}
+
 // confidenceFor scores how much the trend should be believed.
 //
-// Three things erode confidence: too few samples, a poor linear fit (bursty
-// counters), and frequent counter resets.
-func confidenceFor(t ECCTrend) float64 {
+// Three things erode confidence: too few points, a poor linear fit (a bursty
+// counter, a load-driven gauge), and frequent counter resets.
+func confidenceFor(f fit) float64 {
 	c := 1.0
 
-	if t.Samples < 10 {
-		c *= 0.5 + 0.05*float64(t.Samples-minSamplesForTrend)
+	if f.Points < 10 {
+		c *= 0.5 + 0.05*float64(f.Points-minSamplesForTrend)
 	}
 	// A bursty counter still carries signal, so floor the penalty rather than
 	// letting a low R² zero it out.
-	c *= math.Max(0.4, t.RSquared)
+	c *= math.Max(0.4, f.RSquared)
 
-	if t.Resets > 0 {
-		c *= math.Max(0.5, 1.0-0.15*float64(t.Resets))
+	if f.Resets > 0 {
+		c *= math.Max(0.5, 1.0-0.15*float64(f.Resets))
 	}
-	if t.Span < 6*time.Hour {
+	if f.Span < 6*time.Hour {
 		c *= 0.8
 	}
 

@@ -201,6 +201,26 @@ func TestHost_ThermalMarginIsThresholdMinusReading(t *testing.T) {
 	}
 }
 
+func TestHost_SensorWithoutACriticalThresholdHasNoMargin(t *testing.T) {
+	// A reading with nothing to compare it against is not a margin of zero, and
+	// it is not a margin of the reading either. Vendors leave
+	// UpperThresholdCritical unset on plenty of sensors — ambient inlets, board
+	// probes — and the margin analysis has to not see them at all, because 0°C of
+	// margin is a sensor on the edge of tripping.
+	m := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: nil}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	if len(got.ThermalMargins) != 0 {
+		t.Errorf("a sensor with no critical threshold produced margins %+v", got.ThermalMargins)
+	}
+	// The reading itself was reported and is still worth having.
+	if len(got.Temperatures) == 0 {
+		t.Error("the temperature reading was dropped along with the missing threshold")
+	}
+}
+
 func TestHost_UnreportedCounterIsAbsentNotZero(t *testing.T) {
 	// The most important behaviour in this package. A BMC that omits the counter
 	// must not produce a zero, because zero reads as "healthy DIMM" and would

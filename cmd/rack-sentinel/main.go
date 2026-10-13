@@ -230,6 +230,10 @@ not the same as components with high counters. A DIMM at 10,000 correctable
 errors that has been flat for a year is ECC doing its job. One at 200 that
 doubled this week is on its way to taking the node down.
 
+The same reasoning runs over thermal margins, where it inverts: a sensor holding
+5C of headroom for a month is a fan curve, and one that had 40C and now has 20C
+is losing cooling and will cross its critical threshold on a schedule.
+
 usage:
   rack-sentinel -targets fleet.csv [-history state.json] [flags]
 
