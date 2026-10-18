@@ -32,6 +32,11 @@ const (
 	mThermalShrink  = "rack_sentinel_thermal_margin_shrink_celsius_per_hour"
 	mThermalAccel   = "rack_sentinel_thermal_shrink_acceleration_ratio"
 	mThermalHours   = "rack_sentinel_thermal_hours_to_critical"
+	mDriveLifeLeft  = "rack_sentinel_drive_media_life_left_percent"
+	mDriveWear      = "rack_sentinel_drive_media_wear_percent_per_day"
+	mDriveAccel     = "rack_sentinel_drive_wear_acceleration_ratio"
+	mDriveDays      = "rack_sentinel_drive_days_to_spent"
+	mDriveVendor    = "rack_sentinel_drive_vendor_failure_predicted"
 	mSeverity       = "rack_sentinel_finding_severity"
 	mConfidence     = "rack_sentinel_finding_confidence_ratio"
 )
@@ -91,6 +96,13 @@ func promText(r analyze.Report) []byte {
 			return thermal[i].Host < thermal[j].Host
 		}
 		return thermal[i].Trend.Component < thermal[j].Trend.Component
+	})
+	drives := append([]analyze.HostDriveTrend(nil), r.DriveTrends...)
+	sort.SliceStable(drives, func(i, j int) bool {
+		if drives[i].Host != drives[j].Host {
+			return drives[i].Host < drives[j].Host
+		}
+		return drives[i].Trend.Component < drives[j].Trend.Component
 	})
 	findings := append([]analyze.Finding(nil), r.Findings...)
 	sort.SliceStable(findings, func(i, j int) bool {
@@ -204,6 +216,77 @@ func promText(r analyze.Report) []byte {
 			continue
 		}
 		sample(&b, mThermalHours, hours, label{"host", t.Host}, label{"sensor", t.Trend.Component})
+	}
+
+	// Third signal, same absence rule, and the inversion is sharper again than it
+	// is on a margin: 0 here is not a neutral reading or a sensor on its
+	// threshold, it is the vendor's verdict that a drive has no media life left.
+	// Most firmware populates this field for NVMe and omits it entirely for SAS
+	// and SATA, so the drives with no series are the common case rather than the
+	// pathological one.
+	declare(&b, mDriveLifeLeft, "gauge",
+		"Vendor estimate of the percentage of media life remaining on this drive. Drives that reported no estimate are absent, not 0.")
+	for _, t := range drives {
+		if t.Trend.Samples == 0 {
+			continue
+		}
+		sample(&b, mDriveLifeLeft, t.Trend.LifeLeftPercent, label{"host", t.Host}, label{"drive", t.Trend.Component})
+	}
+
+	// Per day rather than per hour, unlike the two rate families above. A drive
+	// on course to be spent inside the year wears about 0.04%/hour, and the unit
+	// a number is read in is the one it should be published in — the same
+	// reasoning that put the other two in per-hour rather than the per-second the
+	// naming conventions would prefer.
+	declare(&b, mDriveWear, "gauge",
+		"Percentage points of media life spent per day, from the least-squares fit. Absent when the estimate has not stepped often enough to trend.")
+	for _, t := range drives {
+		if !t.Trend.Trendable() {
+			continue
+		}
+		sample(&b, mDriveWear, t.Trend.WearPerDay, label{"host", t.Host}, label{"drive", t.Trend.Component})
+	}
+
+	declare(&b, mDriveAccel, "gauge",
+		"Recent-half wear rate divided by the earlier-half rate; above 1 means the drive is being written harder than it was. Absent unless the drive is wearing.")
+	for _, t := range drives {
+		// Gated on the drive actually wearing, for the same reason the thermal
+		// ratio is: on a drive whose estimate has not moved the earlier half is
+		// flat and the ratio reports its 999 cap, which is a dramatic number
+		// nothing should be alerted on.
+		if !t.Trend.Wearing() || t.Trend.Acceleration == 0 {
+			continue
+		}
+		sample(&b, mDriveAccel, t.Trend.Acceleration, label{"host", t.Host}, label{"drive", t.Trend.Component})
+	}
+
+	// Published only where the analysis would publish it, and the bar is higher
+	// than the thermal one: this is a date extrapolated from a vendor's endurance
+	// model, so it waits for enough steps in the estimate that the slope is not
+	// mostly a statement about where two step edges landed.
+	declare(&b, mDriveDays, "gauge",
+		"Projected days until this drive's media life is spent at the current rate. Absent unless the estimate has stepped often enough to extrapolate.")
+	for _, t := range drives {
+		days, ok := t.Trend.DaysToSpent()
+		if !ok {
+			continue
+		}
+		sample(&b, mDriveDays, days, label{"host", t.Host}, label{"drive", t.Trend.Component})
+	}
+
+	// The vendor's own verdict, exported next to this tool's so the two can be
+	// compared in a query rather than only in the prose. Absent for every drive
+	// that is not flagged, which is a third distinct reason for an absence: not
+	// "the BMC said nothing" but "Redfish gives no way to tell a false from an
+	// unimplemented field". A 0 here would turn "we cannot tell" into "the vendor
+	// says this drive is fine".
+	declare(&b, mDriveVendor, "gauge",
+		"1 when the drive's own firmware predicts a failure. Drives not flagged are absent, not 0: Redfish cannot distinguish a false from an unimplemented field.")
+	for _, t := range drives {
+		if !t.Trend.VendorFailurePredicted {
+			continue
+		}
+		sample(&b, mDriveVendor, 1, label{"host", t.Host}, label{"drive", t.Trend.Component})
 	}
 
 	declare(&b, mSeverity, "gauge",

@@ -27,6 +27,25 @@ type redfishMock struct {
 	reading   *float64
 	threshold *float64
 
+	// lifeLeft is the drive's PredictedMediaLifeLeftPercent; nil omits the field
+	// entirely, which is how most firmware behaves on SAS and SATA.
+	lifeLeft *float64
+	// failurePredicted is the drive's vendor-defined failure prediction. Redfish
+	// types it as a plain boolean with no null, so there is no unreported state
+	// to model here — which is itself the thing worth pinning.
+	failurePredicted bool
+	// omitStorage drops the Storage link from the system, which is every BMC
+	// whose drives hang off a controller it does not expose over Redfish.
+	omitStorage bool
+	// breakStorage makes the Storage collection fail.
+	breakStorage bool
+	// breakDrive makes the drive resource itself fail while the subsystem listing
+	// it succeeds.
+	breakDrive bool
+	// anonymousDrive omits both Name and Id, which leaves nothing to key the
+	// series on.
+	anonymousDrive bool
+
 	requests atomic.Int64
 	delay    time.Duration
 }
@@ -66,12 +85,67 @@ func (m *redfishMock) handler() http.Handler {
 	})
 
 	mux.HandleFunc("/redfish/v1/Systems/1", func(w http.ResponseWriter, r *http.Request) {
-		write(w, map[string]any{
+		body := map[string]any{
 			"@odata.id": "/redfish/v1/Systems/1",
 			"Id":        "1",
 			"Name":      "System",
 			"Memory":    map[string]string{"@odata.id": "/redfish/v1/Systems/1/Memory"},
+		}
+		if !m.omitStorage {
+			body["Storage"] = map[string]string{"@odata.id": "/redfish/v1/Systems/1/Storage"}
+		}
+		write(w, body)
+	})
+
+	mux.HandleFunc("/redfish/v1/Systems/1/Storage", func(w http.ResponseWriter, r *http.Request) {
+		if m.breakStorage {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		write(w, map[string]any{
+			"@odata.id":           "/redfish/v1/Systems/1/Storage",
+			"Name":                "Storage Collection",
+			"Members":             []map[string]string{{"@odata.id": "/redfish/v1/Systems/1/Storage/NVMe"}},
+			"Members@odata.count": 1,
 		})
+	})
+
+	mux.HandleFunc("/redfish/v1/Systems/1/Storage/NVMe", func(w http.ResponseWriter, r *http.Request) {
+		// Drives hang off Storage as a link array rather than a collection, which
+		// is why the collector walks them differently from Memory.
+		write(w, map[string]any{
+			"@odata.id": "/redfish/v1/Systems/1/Storage/NVMe",
+			"Id":        "NVMe",
+			"Name":      "NVMe Subsystem",
+			"Drives": []map[string]string{
+				{"@odata.id": "/redfish/v1/Systems/1/Storage/NVMe/Drives/Bay1"},
+			},
+		})
+	})
+
+	mux.HandleFunc("/redfish/v1/Systems/1/Storage/NVMe/Drives/Bay1", func(w http.ResponseWriter, r *http.Request) {
+		if m.breakDrive {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		body := map[string]any{
+			"@odata.id":        "/redfish/v1/Systems/1/Storage/NVMe/Drives/Bay1",
+			"Id":               "Bay1",
+			"Name":             "Bay 1",
+			"MediaType":        "SSD",
+			"Protocol":         "NVMe",
+			"CapacityBytes":    1920383410176,
+			"FailurePredicted": m.failurePredicted,
+			"Status":           map[string]any{"Health": "OK", "State": "Enabled"},
+		}
+		if m.lifeLeft != nil {
+			body["PredictedMediaLifeLeftPercent"] = *m.lifeLeft
+		}
+		if m.anonymousDrive {
+			delete(body, "Id")
+			delete(body, "Name")
+		}
+		write(w, body)
 	})
 
 	mux.HandleFunc("/redfish/v1/Systems/1/Memory", func(w http.ResponseWriter, r *http.Request) {
@@ -407,5 +481,135 @@ func TestSumReported(t *testing.T) {
 				t.Errorf("sumReported = (%v, %v), want (%v, %v)", got, any, tt.want, tt.wantAny)
 			}
 		})
+	}
+}
+
+func TestHost_ReadsReportedDriveLife(t *testing.T) {
+	m := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: f64p(95), lifeLeft: f64p(62)}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	if got.Err != nil {
+		t.Fatalf("unexpected error: %v", got.Err)
+	}
+	if v, ok := got.MediaLifeLeft["Bay 1"]; !ok || v != 62 {
+		t.Errorf("MediaLifeLeft[Bay 1] = %v (present=%v), want 62", v, ok)
+	}
+}
+
+func TestHost_DriveWithoutALifeEstimateIsAbsentNotZero(t *testing.T) {
+	// The invariant at its sharpest. Most firmware populates
+	// PredictedMediaLifeLeftPercent on NVMe and omits it on SAS and SATA, so a
+	// zero here would not merely look like a healthy drive the way a zeroed error
+	// counter does — it would read as the opposite, a drive with no media life
+	// left at all, and condemn a chassis of working disks.
+	m := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: f64p(95), lifeLeft: nil}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	if v, ok := got.MediaLifeLeft["Bay 1"]; ok {
+		t.Errorf("absent life estimate recorded as %v; it must be omitted entirely", v)
+	}
+}
+
+func TestHost_ZeroLifeLeftIsRecordedAsSpent(t *testing.T) {
+	// The converse: a drive the firmware says is out of media life is reporting a
+	// real measurement and that fact has to survive collection.
+	m := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: f64p(95), lifeLeft: f64p(0)}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	v, ok := got.MediaLifeLeft["Bay 1"]
+	if !ok {
+		t.Fatal("an explicit zero should be recorded")
+	}
+	if v != 0 {
+		t.Errorf("value = %v, want 0", v)
+	}
+}
+
+func TestHost_VendorFailurePredictionIsRecordedOnlyWhenSet(t *testing.T) {
+	// The vendor's own opinion, collected so the analysis can be shown next to
+	// it. Only the true case gets an entry, and that is not tidiness: Redfish
+	// types FailurePredicted as a plain boolean, so a firmware that does not
+	// implement it decodes identically to one reporting a clear drive. Recording
+	// false would be asserting something the BMC never said.
+	flagged := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: f64p(95), lifeLeft: f64p(80), failurePredicted: true}
+	clear := &redfishMock{correctable: intp(0), reading: f64p(50), threshold: f64p(95), lifeLeft: f64p(80)}
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: serve(t, flagged).URL})
+	if !got.FailurePredicted["Bay 1"] {
+		t.Error("a flagged drive was not recorded")
+	}
+
+	got = Host(context.Background(), Target{Host: "node-1", Endpoint: serve(t, clear).URL})
+	if _, ok := got.FailurePredicted["Bay 1"]; ok {
+		t.Error("an unflagged drive got an entry; absence is the only honest encoding of a boolean with no null")
+	}
+	// The life estimate is still collected either way.
+	if _, ok := got.MediaLifeLeft["Bay 1"]; !ok {
+		t.Error("the life estimate was dropped along with the clear flag")
+	}
+}
+
+func TestHost_MissingStorageIsSurvivable(t *testing.T) {
+	// Plenty of BMCs expose no Storage subsystem at all. That is not a host
+	// failure and must not cost the memory and thermal data already collected.
+	m := &redfishMock{omitStorage: true, correctable: intp(7), reading: f64p(50), threshold: f64p(95)}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	if got.Err != nil {
+		t.Fatalf("a system without a Storage link must not fail the host: %v", got.Err)
+	}
+	if len(got.MediaLifeLeft) != 0 {
+		t.Errorf("expected no drive estimates, got %+v", got.MediaLifeLeft)
+	}
+	if got.CorrectableErrors["DIMM_A1"] != 7 || len(got.Temperatures) == 0 {
+		t.Error("memory and thermal data should still be collected when storage is absent")
+	}
+}
+
+func TestHost_UnreadableStorageIsSurvivable(t *testing.T) {
+	// A storage subsystem that answers with an error, and a drive resource that
+	// does, are both routine on firmware mid-reboot. Neither is a host failure
+	// and neither may cost the memory and thermal data already collected.
+	for name, m := range map[string]*redfishMock{
+		"collection fails": {breakStorage: true, correctable: intp(3), reading: f64p(50), threshold: f64p(95)},
+		"drive fails":      {breakDrive: true, correctable: intp(3), reading: f64p(50), threshold: f64p(95)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := Host(context.Background(), Target{Host: "node-1", Endpoint: serve(t, m).URL})
+
+			if got.Err != nil {
+				t.Fatalf("unreadable storage failed the host: %v", got.Err)
+			}
+			if len(got.MediaLifeLeft) != 0 {
+				t.Errorf("expected no drive estimates, got %+v", got.MediaLifeLeft)
+			}
+			if got.CorrectableErrors["DIMM_A1"] != 3 || len(got.Temperatures) == 0 {
+				t.Error("memory and thermal data were lost with the storage error")
+			}
+		})
+	}
+}
+
+func TestHost_DriveWithNoIdentifierIsSkipped(t *testing.T) {
+	// A drive with neither Name nor Id has nothing to key a series on, and a
+	// series keyed on an empty string would merge every such drive in the chassis
+	// into one. Dropping it loses a drive; keeping it invents a trend across
+	// several, so it is dropped.
+	m := &redfishMock{anonymousDrive: true, lifeLeft: f64p(40), failurePredicted: true,
+		correctable: intp(0), reading: f64p(50), threshold: f64p(95)}
+	srv := serve(t, m)
+
+	got := Host(context.Background(), Target{Host: "node-1", Endpoint: srv.URL})
+
+	if len(got.MediaLifeLeft) != 0 || len(got.FailurePredicted) != 0 {
+		t.Errorf("an unidentifiable drive was recorded: %+v / %+v", got.MediaLifeLeft, got.FailurePredicted)
 	}
 }

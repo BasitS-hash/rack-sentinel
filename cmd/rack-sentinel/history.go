@@ -38,6 +38,7 @@ const defaultRetention = 14 * 24 * time.Hour
 const (
 	keyECC           = "ecc.correctable/"
 	keyThermalMargin = "thermal.margin/"
+	keyDriveLife     = "drive.life/"
 )
 
 // history is the persisted per-counter time series across runs.
@@ -116,6 +117,22 @@ func (h *history) append(telemetry []collect.HostTelemetry) {
 				At: t.CollectedAt, Value: margin,
 			})
 		}
+
+		// Same rule again, and the consequence of breaking it is worse here: a
+		// drive absent from the map reported no media-life estimate, and 0% of
+		// media life left is a spent drive. Most firmware omits the field
+		// entirely on SAS and SATA.
+		for drive, lifeLeft := range t.MediaLifeLeft {
+			key := keyDriveLife + drive
+			byComponent[key] = appendCapped(byComponent[key], analyze.Sample{
+				At: t.CollectedAt, Value: lifeLeft,
+			})
+		}
+
+		// FailurePredicted is deliberately not persisted. It is the vendor's
+		// verdict right now, not a measurement with a history: trending a boolean
+		// would say only how many polls ago the firmware changed its mind, and
+		// the current poll already carries it to the analysis.
 	}
 }
 
@@ -156,6 +173,8 @@ func (h *history) prune(now time.Time, retain time.Duration) {
 				components[key] = analyze.PruneCounter(samples, cutoff)
 			case strings.HasPrefix(key, keyThermalMargin):
 				components[key] = analyze.PruneGauge(samples, cutoff)
+			case strings.HasPrefix(key, keyDriveLife):
+				components[key] = analyze.PruneWear(samples, cutoff)
 			}
 			// A key this version does not recognise is left whole. It was written
 			// by a different build and trimming it by rules that may not apply to
@@ -202,11 +221,17 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 	}
 	sort.Strings(hosts)
 
-	// One trend per counter, including the flat ones: the metrics exporter needs
+	// One trend per series, including the flat ones: the metrics exporter needs
 	// the numbers behind every series, not only the ones that produced a
-	// finding. Preallocated because at fleet scale this is one per DIMM.
+	// finding. Preallocated because at fleet scale this is one per DIMM, sensor
+	// and drive bay.
 	report.Trends = make([]analyze.HostTrend, 0, series)
 	report.ThermalTrends = make([]analyze.HostThermalTrend, 0, series)
+	report.DriveTrends = make([]analyze.HostDriveTrend, 0, series)
+
+	// The vendor's own failure prediction comes from this poll rather than from
+	// the file, so it has to be indexed before the series are walked.
+	flagged := flaggedDrives(telemetry)
 
 	for _, host := range hosts {
 		components := h.Series[host]
@@ -237,6 +262,18 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 					analyze.HostThermalTrend{Host: host, Trend: trend})
 				finding = f
 
+			case keyDriveLife:
+				trend, f := analyze.AnalyzeDriveWear(host, analyze.Series{
+					Component: name,
+					Samples:   components[key],
+				}, flagged[host][name])
+				report.DriveTrends = append(report.DriveTrends,
+					analyze.HostDriveTrend{Host: host, Trend: trend})
+				finding = f
+				// Covered by the series walk, so the sweep below must not report
+				// this bay a second time.
+				delete(flagged[host], name)
+
 			default:
 				continue
 			}
@@ -247,13 +284,62 @@ func (h *history) analyze(telemetry []collect.HostTelemetry) analyze.Report {
 		}
 	}
 
+	// The drives the firmware flagged that have no series to walk. This is the
+	// common SAS and SATA case — the vendor predicts a failure and never
+	// populates a media-life estimate — and without this sweep the only signal
+	// anybody has on those drives would be dropped for having nothing to trend.
+	for _, host := range sortedKeys(flagged) {
+		for _, drive := range sortedKeys(flagged[host]) {
+			trend, f := analyze.AnalyzeDriveWear(host, analyze.Series{Component: drive}, true)
+			report.DriveTrends = append(report.DriveTrends,
+				analyze.HostDriveTrend{Host: host, Trend: trend})
+			if f != nil {
+				report.Findings = append(report.Findings, *f)
+			}
+		}
+	}
+
 	return report
+}
+
+// flaggedDrives indexes this poll's vendor failure predictions by host and
+// drive.
+//
+// Copied rather than read through to the telemetry because analyze deletes from
+// it as the series walk covers each bay, and mutating the caller's collected
+// telemetry to track bookkeeping would be a surprising thing for a function
+// named analyze to do.
+func flaggedDrives(telemetry []collect.HostTelemetry) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, t := range telemetry {
+		for drive, predicted := range t.FailurePredicted {
+			if !predicted {
+				continue
+			}
+			if out[t.Host] == nil {
+				out[t.Host] = map[string]bool{}
+			}
+			out[t.Host][drive] = true
+		}
+	}
+	return out
+}
+
+// sortedKeys returns m's keys in order, so that repeated runs over identical
+// state produce identical output.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // trimKey splits a series key into the component name and the prefix that says
 // what kind of measurement it is. An unrecognised key returns an empty prefix.
 func trimKey(key string) (name, prefix string) {
-	for _, p := range []string{keyECC, keyThermalMargin} {
+	for _, p := range []string{keyECC, keyThermalMargin, keyDriveLife} {
 		if name, ok := strings.CutPrefix(key, p); ok {
 			return name, p
 		}

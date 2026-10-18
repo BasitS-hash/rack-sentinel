@@ -56,6 +56,22 @@ type HostTelemetry struct {
 	// upper critical threshold. Negative means the threshold is exceeded.
 	ThermalMargins map[string]float64
 
+	// MediaLifeLeft maps a drive identifier to the vendor's estimate of the
+	// percentage of media life remaining, 100 down to 0. A drive absent from this
+	// map did not report an estimate, which is the opposite condition from one
+	// reporting 0 — most firmware populates the field on NVMe and omits it
+	// entirely on SAS and SATA.
+	MediaLifeLeft map[string]float64
+
+	// FailurePredicted holds the drives whose own firmware predicts a failure.
+	//
+	// Only the flagged drives get an entry. Redfish types FailurePredicted as a
+	// plain boolean with no null, so a firmware that does not implement it
+	// decodes identically to one reporting a clear drive; recording false would
+	// assert something no BMC said. Absence here therefore means "not flagged",
+	// never "the vendor says healthy".
+	FailurePredicted map[string]bool
+
 	// Err is set when this host could not be polled. One unreachable BMC must
 	// not fail the fleet run, so the error travels with the result.
 	Err error
@@ -69,6 +85,8 @@ func newHostTelemetry(host string) HostTelemetry {
 		UncorrectableErrors: map[string]float64{},
 		Temperatures:        map[string]float64{},
 		ThermalMargins:      map[string]float64{},
+		MediaLifeLeft:       map[string]float64{},
+		FailurePredicted:    map[string]bool{},
 	}
 }
 
@@ -194,6 +212,7 @@ func Host(ctx context.Context, t Target) HostTelemetry {
 	}
 	for _, sys := range systems {
 		collectMemory(sys, &out)
+		collectDrives(sys, &out)
 	}
 
 	chassis, err := client.Service.Chassis()
@@ -261,6 +280,51 @@ func sumReported(values ...*int) (float64, bool) {
 		}
 	}
 	return total, any
+}
+
+// collectDrives records each drive's media-life estimate and the vendor's own
+// failure prediction.
+//
+// Drives are reached through the Storage subsystem rather than hanging off the
+// system directly, and they are a link array on Storage rather than a
+// collection, which is why this walk does not look like collectMemory's.
+//
+// Two numbers come back and they are not the same kind of thing.
+// PredictedMediaLifeLeftPercent is a pointer because it is optional, and most
+// firmware populates it for NVMe only — a nil is "not reported" and is skipped,
+// never coerced to zero, which here would mean a drive with no life left rather
+// than a healthy one. FailurePredicted is the vendor's own threshold verdict,
+// kept so the analysis can be published next to it instead of in place of it.
+func collectDrives(sys *schemas.ComputerSystem, out *HostTelemetry) {
+	// No Storage link at all is common — the drives may hang off a controller the
+	// BMC does not expose over Redfish. Nothing collected so far is lost.
+	subsystems, err := sys.Storage()
+	if err != nil {
+		return
+	}
+	for _, st := range subsystems {
+		drives, err := st.Drives()
+		if err != nil {
+			// One unreadable subsystem must not cost the others.
+			continue
+		}
+		for _, d := range drives {
+			name := d.Name
+			if name == "" {
+				name = d.ID
+			}
+			if name == "" {
+				continue
+			}
+
+			if d.PredictedMediaLifeLeftPercent != nil {
+				out.MediaLifeLeft[name] = *d.PredictedMediaLifeLeftPercent
+			}
+			if d.FailurePredicted {
+				out.FailurePredicted[name] = true
+			}
+		}
+	}
 }
 
 // collectThermal records sensor readings and their margin to the upper critical

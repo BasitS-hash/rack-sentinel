@@ -166,3 +166,84 @@ func TestPruneGauge_EdgeCases(t *testing.T) {
 		t.Errorf("kept %d of 3 readings; an untrendable sensor cannot be improved by pruning it", len(got))
 	}
 }
+
+func TestPruneWear_KeepsEnoughToStillSpeakAboutTheDrive(t *testing.T) {
+	// A third series shape in the same file, and it needs both halves of both
+	// other rules — which is why it gets its own function rather than borrowing
+	// one. The floor it needs is a week, far past the counter's thirty minutes
+	// and the gauge's day, because the estimate only steps about once a day and
+	// a rate wants several steps.
+	s := lifeLeft("Bay 1", 90, 1, 480)
+	cutoff := base.Add(400 * time.Hour)
+
+	byGaugeRule := PruneGauge(s.Samples, cutoff)
+	byWearRule := PruneWear(s.Samples, cutoff)
+
+	gaugeTrend, _ := AnalyzeDriveWear("node-1", Series{Component: s.Component, Samples: byGaugeRule}, false)
+	if gaugeTrend.Trendable() {
+		t.Fatalf("guard: the gauge floor was expected to leave an untrendable drive, got %d readings over %s with %d steps",
+			gaugeTrend.Samples, gaugeTrend.Span, gaugeTrend.Steps)
+	}
+
+	wearTrend, f := AnalyzeDriveWear("node-1", Series{Component: s.Component, Samples: byWearRule}, false)
+	if !wearTrend.Trendable() {
+		t.Errorf("the wear rule left %d readings over %s with %d steps, below the %d over %s with %d the analyser needs",
+			wearTrend.Samples, wearTrend.Span, wearTrend.Steps,
+			minSamplesForWear, minSpanForWear, minWearSteps)
+	}
+	if f == nil {
+		t.Fatal("pruning silenced a drive that is burning media life")
+	}
+	if len(byWearRule) >= len(s.Samples) {
+		t.Errorf("kept %d of %d readings — retention has to actually delete something",
+			len(byWearRule), len(s.Samples))
+	}
+}
+
+func TestPruneWear_KeepsTheReplacementBoundary(t *testing.T) {
+	// The half PruneGauge does not have, and the reason a drive series is not a
+	// gauge for retention purposes. A swap in the bay is this signal's counter
+	// reset; drop the reading on the worn side of it and the jump disappears,
+	// the epoch split goes with it, and the fit then spans two different drives
+	// and reports the fresh one as recovering.
+	old := lifeLeft("Bay 1", 30, 1, 240)
+	fresh := lifeLeft("Bay 1", 100, 1, 240)
+	vals := make([]float64, 0, 480)
+	for _, s := range old.Samples {
+		vals = append(vals, s.Value)
+	}
+	for _, s := range fresh.Samples {
+		vals = append(vals, s.Value)
+	}
+	s := series("Bay 1", vals...)
+
+	// A cutoff well past the swap, which an age-only cut would take the boundary
+	// reading with.
+	pruned := PruneWear(s.Samples, base.Add(300*time.Hour))
+
+	trend, f := AnalyzeDriveWear("node-1", Series{Component: "Bay 1", Samples: pruned}, false)
+	if trend.Replacements != 1 {
+		t.Errorf("replacements = %d, want 1 — the boundary reading was pruned away", trend.Replacements)
+	}
+	if f == nil {
+		t.Fatal("pruning silenced the fresh drive wearing in that bay")
+	}
+	if trend.WearPerDay <= 0 {
+		t.Errorf("wear rate = %.4f, want positive — the fit spans the swap", trend.WearPerDay)
+	}
+}
+
+func TestPruneWear_EdgeCases(t *testing.T) {
+	if got := PruneWear(nil, base); got != nil {
+		t.Errorf("PruneWear(nil) = %+v, want nil", got)
+	}
+	s := lifeLeft("Bay 1", 90, 1, 240)
+	if got := PruneWear(s.Samples, base); len(got) != 240 {
+		t.Errorf("a cutoff at the oldest reading dropped %d readings", 240-len(got))
+	}
+	// Already thinner than the wear trend floor: nothing is safe to drop.
+	short := series("Bay 1", 50, 50, 49)
+	if got := PruneWear(short.Samples, base.Add(1000*time.Hour)); len(got) != 3 {
+		t.Errorf("kept %d of 3 readings; an untrendable drive cannot be improved by pruning it", len(got))
+	}
+}

@@ -248,8 +248,20 @@ func currentEpoch(samples []Sample) ([]Sample, int) {
 // number of resets seen across the whole series. Retention needs the index on
 // its own, and there must be exactly one definition of where an epoch begins.
 func epochStart(samples []Sample) (start, resets int) {
+	return epochStartBeyond(samples, 0)
+}
+
+// epochStartBeyond is epochStart counting only drops larger than minDrop.
+//
+// A BMC counter resets to zero, so any decrease at all is unambiguously a new
+// epoch and minDrop is 0. A vendor-computed gauge is not that clean: a drive's
+// media-life estimate is a model output that can tick back up by a point when
+// the firmware recalculates, and treating that as a new epoch would discard the
+// history behind it. Those callers pass the smallest drop that can only be a
+// genuine discontinuity.
+func epochStartBeyond(samples []Sample, minDrop float64) (start, resets int) {
 	for i := 1; i < len(samples); i++ {
-		if samples[i].Value < samples[i-1].Value {
+		if samples[i-1].Value-samples[i].Value > minDrop {
 			resets++
 			start = i
 		}
