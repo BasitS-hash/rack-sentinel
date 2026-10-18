@@ -27,10 +27,7 @@ func PruneCounter(samples []Sample, cutoff time.Time) []Sample {
 		return samples
 	}
 
-	cut := 0
-	for cut < len(samples) && samples[cut].At.Before(cutoff) {
-		cut++
-	}
+	cut := ageCut(samples, cutoff)
 	if cut == 0 {
 		return samples
 	}
@@ -68,10 +65,7 @@ func PruneGauge(samples []Sample, cutoff time.Time) []Sample {
 		return samples
 	}
 
-	cut := 0
-	for cut < len(samples) && samples[cut].At.Before(cutoff) {
-		cut++
-	}
+	cut := ageCut(samples, cutoff)
 	if cut == 0 {
 		return samples
 	}
@@ -80,6 +74,56 @@ func PruneGauge(samples []Sample, cutoff time.Time) []Sample {
 		cut = floor
 	}
 	return samples[cut:]
+}
+
+// PruneWear drops readings older than cutoff from a drive's media-life estimate.
+//
+// The third series shape in one file, and it is the only one that needs both
+// halves of both other rules — which is why it is its own function rather than
+// a call to one of them.
+//
+// It needs the epoch clamp, which PruneGauge does not have. A drive swapped into
+// the same bay reports a fresh estimate, and that jump is where the current
+// drive's history begins; drop the reading on the worn side of it and the jump
+// goes too, the epoch split stops firing, and the fit spans two drives and
+// reports the new one as recovering. Unlike a counter the clamp is found on the
+// inverted series, because what a replacement does to a declining estimate is
+// the opposite of what a power-cycle does to a counter, and the direction is
+// decided once in wearOf rather than twice here.
+//
+// It needs a far higher floor than PruneCounter protects, for the same reason
+// PruneGauge does but more so: the estimate steps about once a day on a drive
+// that will be spent within the year, so a week of readings is the thinnest
+// thing AnalyzeDriveWear will speak about. Held to the counter's four samples
+// over thirty minutes, or even to the gauge's day, a drive is pruned down to
+// one step and falls silent over data retention chose to delete.
+func PruneWear(samples []Sample, cutoff time.Time) []Sample {
+	if len(samples) == 0 {
+		return samples
+	}
+
+	cut := ageCut(samples, cutoff)
+	if cut == 0 {
+		return samples
+	}
+
+	if start, _ := epochStartBeyond(wearOf(samples), minReplacementDrop); start > 0 && cut > start-1 {
+		cut = start - 1
+	}
+	if floor := trendFloor(samples, minSamplesForWear, minSpanForWear); cut > floor {
+		cut = floor
+	}
+	return samples[cut:]
+}
+
+// ageCut is the index age alone would cut at: the first sample inside the
+// window. Every rule above starts here and then refuses to cut that far.
+func ageCut(samples []Sample, cutoff time.Time) int {
+	cut := 0
+	for cut < len(samples) && samples[cut].At.Before(cutoff) {
+		cut++
+	}
+	return cut
 }
 
 // trendFloor is the latest index a series may start at and still carry enough

@@ -234,6 +234,12 @@ The same reasoning runs over thermal margins, where it inverts: a sensor holding
 5C of headroom for a month is a fan curve, and one that had 40C and now has 20C
 is losing cooling and will cross its critical threshold on a schedule.
 
+And over drive media life, where the vendor ships its own opinion to disagree
+with: a drive sitting on 20% for a year will outlive the node, while one that
+went 90% to 60% in a month is spent on a date you can read off the slope. Both
+that trend and the drive's own FailurePredicted flag are reported, and neither
+suppresses the other.
+
 usage:
   rack-sentinel -targets fleet.csv [-history state.json] [flags]
 

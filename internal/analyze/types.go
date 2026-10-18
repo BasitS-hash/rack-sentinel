@@ -42,8 +42,11 @@ func (s Severity) String() string {
 // Counters from a BMC reset when the host power-cycles, so a decrease is not an
 // error — it is a new epoch. Callers must not assume the series is monotonic;
 // the analysis handles resets explicitly. A gauge, such as a thermal margin,
-// moves in both directions all day and has no epochs at all, which is why the
-// two are analysed and pruned by different rules.
+// moves in both directions all day and has no epochs at all. A vendor-computed
+// estimate, such as a drive's media life left, declines in coarse steps and has
+// epochs that are not as clean as a counter's — the firmware can revise it
+// upward without a drive having been swapped. That is why the three are analysed
+// and pruned by different rules.
 type Sample struct {
 	At    time.Time
 	Value float64
@@ -51,10 +54,11 @@ type Sample struct {
 
 // Series is a time-ordered set of samples for one measurement on one component.
 //
-// The series does not say which of the two it is. That is the caller's business:
-// it knows whether it is handing over a counter or a gauge, and handing one to
-// the wrong analyser is a mistake no amount of inspection at this level could
-// catch — a falling counter and a falling margin look identical here.
+// The series does not say which of the three it is. That is the caller's
+// business: it knows whether it is handing over a counter, a gauge or a vendor
+// estimate, and handing one to the wrong analyser is a mistake no amount of
+// inspection at this level could catch — a falling counter, a falling margin and
+// a falling life estimate look identical here.
 type Series struct {
 	// Component identifies the physical part, e.g. "DIMM_A1" or "CPU0_Die".
 	Component string
@@ -97,6 +101,17 @@ type HostThermalTrend struct {
 	Trend ThermalTrend
 }
 
+// HostDriveTrend is one drive's media-wear trend together with its host.
+//
+// A third sibling rather than a third case in a type switch, for the reason
+// given above: the three trends share the reasoning behind them and almost none
+// of their fields, and the exporter publishes a different metric family from
+// each.
+type HostDriveTrend struct {
+	Host  string
+	Trend DriveWearTrend
+}
+
 // Report is the full result of analysing one fleet poll.
 type Report struct {
 	GeneratedAt time.Time
@@ -113,6 +128,12 @@ type Report struct {
 	// ThermalTrends carries the margin trends, for the same reason and with the
 	// same exclusion from the JSON report.
 	ThermalTrends []HostThermalTrend `json:"-"`
+
+	// DriveTrends carries the drive media-wear trends, likewise. It also carries
+	// the drives that have no trend at all but whose firmware flagged them, so
+	// that the vendor's own prediction is exportable for a drive this analysis
+	// could not speak about.
+	DriveTrends []HostDriveTrend `json:"-"`
 }
 
 // Worst returns the highest severity present, or SeverityInfo when clean.

@@ -65,6 +65,14 @@ func degradingReport() analyze.Report {
 				Span: 71 * time.Hour, Samples: 284, Buckets: 24,
 			},
 		}},
+		DriveTrends: []analyze.HostDriveTrend{{
+			Host: "node-114",
+			Trend: analyze.DriveWearTrend{
+				Component: "Bay 1", LifeLeftPercent: 62, WearPerDay: 0.95,
+				Acceleration: 2.4, RSquared: 0.98,
+				Span: 14 * 24 * time.Hour, Samples: 1344, Steps: 14,
+			},
+		}},
 	}
 }
 
@@ -458,5 +466,191 @@ func TestWriteProm_NoAccelerationForASensorThatIsNotLosingGround(t *testing.T) {
 	}
 	if got := samplesOf(text, "rack_sentinel_thermal_margin_shrink_celsius_per_hour"); len(got) != 1 {
 		t.Errorf("the fitted rate went missing: %s", strings.Join(got, "\n"))
+	}
+}
+
+func TestWriteProm_UnreportedDriveIsAbsentNotZero(t *testing.T) {
+	// The central invariant on the third signal, where a fabricated zero is not
+	// merely optimistic but inverted: 0% of media life left is the vendor's
+	// verdict that a drive is finished. A drive that reported no estimate — every
+	// SAS and SATA disk on most firmware — must have no series at all.
+	r := analyze.Report{
+		GeneratedAt: generatedAt,
+		HostsPolled: 1,
+		DriveTrends: []analyze.HostDriveTrend{{
+			Host:  "node-9",
+			Trend: analyze.DriveWearTrend{Component: "Bay 1"},
+		}},
+	}
+
+	text := render(t, r)
+
+	for _, metric := range []string{
+		"rack_sentinel_drive_media_life_left_percent",
+		"rack_sentinel_drive_media_wear_percent_per_day",
+		"rack_sentinel_drive_wear_acceleration_ratio",
+		"rack_sentinel_drive_days_to_spent",
+		"rack_sentinel_drive_vendor_failure_predicted",
+	} {
+		if got := samplesOf(text, metric); len(got) != 0 {
+			t.Errorf("%s: an unreported drive exported %s", metric, strings.Join(got, "\n"))
+		}
+	}
+}
+
+func TestWriteProm_DriveThesisNumbersAreExported(t *testing.T) {
+	// A drive at 62% of media life left — healthy by any absolute reading —
+	// burning 0.95% a day is spent in about nine weeks, and the point of
+	// exporting all of it is that an alert can be built on the horizon rather
+	// than on the reading.
+	text := render(t, degradingReport())
+
+	for metric, want := range map[string]string{
+		"rack_sentinel_drive_media_life_left_percent":    `rack_sentinel_drive_media_life_left_percent{host="node-114",drive="Bay 1"} 62`,
+		"rack_sentinel_drive_media_wear_percent_per_day": `rack_sentinel_drive_media_wear_percent_per_day{host="node-114",drive="Bay 1"} 0.95`,
+		"rack_sentinel_drive_wear_acceleration_ratio":    `rack_sentinel_drive_wear_acceleration_ratio{host="node-114",drive="Bay 1"} 2.4`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s: missing\n want %s\n got %s", metric, want,
+				strings.Join(samplesOf(text, metric), "\n"))
+		}
+	}
+
+	got := samplesOf(text, "rack_sentinel_drive_days_to_spent")
+	if len(got) != 1 || !strings.Contains(got[0], `drive="Bay 1"`) {
+		t.Fatalf("days-to-spent missing: %s", strings.Join(got, "\n"))
+	}
+	if !strings.Contains(got[0], "} 65.2") {
+		t.Errorf("days to spent = %q, want ~65.3 (62%% at 0.95%%/day)", got[0])
+	}
+}
+
+func TestWriteProm_UnprojectableDriveExportsTheRateButNotAHorizon(t *testing.T) {
+	// The exporter has to ask the same two questions the analyser asks, and on
+	// this signal they are different questions from the thermal ones. Three steps
+	// is enough for a rate and not enough for a replacement date, and the fit is
+	// excellent either way — which is exactly why R² is not the gate here.
+	r := analyze.Report{
+		GeneratedAt: generatedAt,
+		HostsPolled: 1,
+		DriveTrends: []analyze.HostDriveTrend{{
+			Host: "node-9",
+			Trend: analyze.DriveWearTrend{
+				Component: "Bay 2", LifeLeftPercent: 40, WearPerDay: 0.2,
+				RSquared: 0.99, Span: 14 * 24 * time.Hour, Samples: 1344, Steps: 3,
+			},
+		}},
+	}
+
+	text := render(t, r)
+
+	if got := samplesOf(text, "rack_sentinel_drive_media_wear_percent_per_day"); len(got) != 1 {
+		t.Errorf("a trendable drive exported no wear rate: %s", strings.Join(got, "\n"))
+	}
+	if got := samplesOf(text, "rack_sentinel_drive_days_to_spent"); len(got) != 0 {
+		t.Errorf("three steps produced a replacement date: %s", strings.Join(got, "\n"))
+	}
+}
+
+func TestWriteProm_UntrendableDriveStillExportsItsEstimate(t *testing.T) {
+	// The other half, as with a reported zero on a counter: a fortnight that
+	// contained one step is not a trend, but the BMC did report an estimate and
+	// dropping it would lose a drive from the fleet's inventory.
+	r := analyze.Report{
+		GeneratedAt: generatedAt,
+		HostsPolled: 1,
+		DriveTrends: []analyze.HostDriveTrend{{
+			Host: "node-9",
+			Trend: analyze.DriveWearTrend{
+				Component: "Bay 3", LifeLeftPercent: 29,
+				Span: 14 * 24 * time.Hour, Samples: 1344, Steps: 1,
+			},
+		}},
+	}
+
+	text := render(t, r)
+
+	got := samplesOf(text, "rack_sentinel_drive_media_life_left_percent")
+	if len(got) != 1 || !strings.HasSuffix(got[0], " 29") {
+		t.Errorf("a reported estimate was not exported: %q", got)
+	}
+	if got := samplesOf(text, "rack_sentinel_drive_media_wear_percent_per_day"); len(got) != 0 {
+		t.Errorf("an untrendable drive exported a rate: %s", strings.Join(got, "\n"))
+	}
+}
+
+func TestWriteProm_VendorPredictionIsOneOrAbsentNeverZero(t *testing.T) {
+	// Absent-not-zero for a third reason, and it is the sharpest of the three.
+	// The other two signals are absent because the BMC said nothing; this one is
+	// absent because Redfish types FailurePredicted as a boolean with no null, so
+	// a firmware that never implemented it is indistinguishable from one
+	// reporting a clear drive. Exporting 0 would turn "we cannot tell" into "the
+	// vendor says this drive is fine".
+	r := analyze.Report{
+		GeneratedAt: generatedAt,
+		HostsPolled: 1,
+		DriveTrends: []analyze.HostDriveTrend{
+			{
+				Host: "node-9",
+				Trend: analyze.DriveWearTrend{
+					Component: "Bay 7", VendorFailurePredicted: true,
+				},
+			},
+			{
+				Host: "node-9",
+				Trend: analyze.DriveWearTrend{
+					Component: "Bay 8", LifeLeftPercent: 70,
+					Span: 14 * 24 * time.Hour, Samples: 1344,
+				},
+			},
+		},
+	}
+
+	text := render(t, r)
+
+	got := samplesOf(text, "rack_sentinel_drive_vendor_failure_predicted")
+	if len(got) != 1 {
+		t.Fatalf("got %d flag samples, want 1 (only the flagged drive):\n%s", len(got), strings.Join(got, "\n"))
+	}
+	if !strings.Contains(got[0], `drive="Bay 7"`) || !strings.HasSuffix(got[0], " 1") {
+		t.Errorf("flag sample = %q, want Bay 7 at 1", got[0])
+	}
+	// A flagged drive with no estimate still has no life-left series, and an
+	// unflagged one with an estimate still exports it.
+	life := samplesOf(text, "rack_sentinel_drive_media_life_left_percent")
+	if len(life) != 1 || !strings.Contains(life[0], `drive="Bay 8"`) {
+		t.Errorf("life-left samples = %q, want only Bay 8", life)
+	}
+}
+
+func TestWriteProm_DriveFamiliesAreOrdered(t *testing.T) {
+	// Same discipline as the other two: identical state produces an identical
+	// file, sorted by host and then by drive.
+	r := degradingReport()
+	r.DriveTrends = append(r.DriveTrends,
+		analyze.HostDriveTrend{
+			Host:  "node-114",
+			Trend: analyze.DriveWearTrend{Component: "Bay 0", LifeLeftPercent: 88, Samples: 1344},
+		},
+		analyze.HostDriveTrend{
+			Host:  "node-003",
+			Trend: analyze.DriveWearTrend{Component: "Bay 1", LifeLeftPercent: 99, Samples: 1344},
+		},
+	)
+
+	first, second := render(t, r), render(t, r)
+	if first != second {
+		t.Error("two writes of one report differ")
+	}
+
+	got := samplesOf(first, "rack_sentinel_drive_media_life_left_percent")
+	if len(got) != 3 {
+		t.Fatalf("got %d life-left samples, want 3:\n%s", len(got), strings.Join(got, "\n"))
+	}
+	if !strings.Contains(got[0], "node-003") {
+		t.Errorf("drives are not host-ordered:\n%s", strings.Join(got, "\n"))
+	}
+	if !strings.Contains(got[1], `drive="Bay 0"`) || !strings.Contains(got[2], `drive="Bay 1"`) {
+		t.Errorf("two drives on one host are not drive-ordered:\n%s", strings.Join(got, "\n"))
 	}
 }

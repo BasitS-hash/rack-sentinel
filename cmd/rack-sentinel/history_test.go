@@ -503,3 +503,212 @@ func TestHistory_ThermalSeriesGetGaugeRetention(t *testing.T) {
 			len(ecc), len(margins))
 	}
 }
+
+// drivePoll builds one telemetry result for a single drive bay at a given time.
+func drivePoll(host string, at time.Time, lifeLeft float64) collect.HostTelemetry {
+	return collect.HostTelemetry{
+		Host:          host,
+		CollectedAt:   at,
+		MediaLifeLeft: map[string]float64{"Bay 1": lifeLeft},
+	}
+}
+
+func TestHistory_DetectsWearAcrossPolls(t *testing.T) {
+	// The same end-to-end claim as the other two walks, on the third signal. No
+	// single poll can tell you a drive is being written to death: every poll sees
+	// an estimate below 100, which is every drive in service. Only the series
+	// says how fast it is falling.
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "state.json")
+
+	var report analyze.Report
+	for i := 0; i < 336; i++ {
+		h, err := loadHistory(path)
+		if err != nil {
+			t.Fatalf("poll %d: load: %v", i, err)
+		}
+		// Whole percent, the way firmware reports it: a staircase, not a ramp.
+		life := float64(int(95 - float64(i)/24))
+		tele := []collect.HostTelemetry{
+			drivePoll("node-1", start.Add(time.Duration(i)*time.Hour), life),
+		}
+		h.append(tele)
+		report = h.analyze(tele)
+		if err := h.save(path); err != nil {
+			t.Fatalf("poll %d: save: %v", i, err)
+		}
+	}
+
+	var found *analyze.Finding
+	for i := range report.Findings {
+		if report.Findings[i].Kind == "drive.wearing" {
+			found = &report.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no drive finding after 336 polls: %+v", report.Findings)
+	}
+	if found.Component != "Bay 1" {
+		t.Errorf("component = %q, want Bay 1", found.Component)
+	}
+	if found.Severity < analyze.SeverityPlan {
+		t.Errorf("severity = %s, want at least PLAN", found.Severity)
+	}
+
+	// The trend has to reach the exporter too, not only the prose.
+	if len(report.DriveTrends) != 1 {
+		t.Fatalf("got %d drive trends, want 1", len(report.DriveTrends))
+	}
+	if report.DriveTrends[0].Trend.WearPerDay <= 0 {
+		t.Errorf("exported wear rate = %.4f, want positive", report.DriveTrends[0].Trend.WearPerDay)
+	}
+}
+
+func TestHistory_DriveTheBMCStoppedReportingAddsNoSample(t *testing.T) {
+	// The absent-not-zero invariant where the series is built, on the signal
+	// where coercion is most destructive: a 0 here is a drive with no media life
+	// left, so a BMC that drops the field for one poll would otherwise record a
+	// spent disk.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	h.append([]collect.HostTelemetry{drivePoll("node-1", start, 80)})
+	h.append([]collect.HostTelemetry{{
+		Host: "node-1", CollectedAt: start.Add(time.Hour),
+		MediaLifeLeft: map[string]float64{}, // BMC answered, drive reported no estimate
+	}})
+	h.append([]collect.HostTelemetry{drivePoll("node-1", start.Add(2*time.Hour), 79)})
+
+	samples := h.Series["node-1"]["drive.life/Bay 1"]
+	if len(samples) != 2 {
+		t.Fatalf("got %d readings, want 2 — the poll that omitted the estimate must not contribute", len(samples))
+	}
+	for _, s := range samples {
+		if s.Value == 0 {
+			t.Error("a drive with no reported estimate was recorded as 0% media life left")
+		}
+	}
+}
+
+func TestHistory_DriveSeriesGetWearRetention(t *testing.T) {
+	// Three series shapes now land in the same file and all three are pruned by
+	// different rules. A drive held to the thermal floor keeps a day of readings,
+	// which contains at most one step, and the bay goes quiet.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 336; i++ {
+		at := start.Add(time.Duration(i) * time.Hour)
+		h.append([]collect.HostTelemetry{{
+			Host:              "node-1",
+			CollectedAt:       at,
+			CorrectableErrors: map[string]float64{"DIMM_A1": float64(10 * i)},
+			ThermalMargins:    map[string]float64{"CPU0_Die": 40 - 0.1*float64(i)},
+			MediaLifeLeft:     map[string]float64{"Bay 1": float64(int(95 - float64(i)/24))},
+		}})
+	}
+	last := start.Add(335 * time.Hour)
+
+	// A window far shorter than what any of the three trends needs.
+	h.prune(last, 2*time.Hour)
+
+	drive := h.Series["node-1"]["drive.life/Bay 1"]
+	trend, f := analyze.AnalyzeDriveWear("node-1", analyze.Series{Component: "Bay 1", Samples: drive}, false)
+	if !trend.Trendable() {
+		t.Errorf("retention left %d readings over %s with %d steps — the bay can no longer be trended",
+			trend.Samples, trend.Span, trend.Steps)
+	}
+	if f == nil {
+		t.Error("retention silenced a drive that is burning media life")
+	}
+
+	// And the two series beside it keep their own floors, not the drive's.
+	if len(h.Series["node-1"]["ecc.correctable/DIMM_A1"]) == 0 {
+		t.Error("the ECC series was deleted outright")
+	}
+	if len(h.Series["node-1"]["thermal.margin/CPU0_Die"]) == 0 {
+		t.Error("the thermal series was deleted outright")
+	}
+}
+
+func TestHistory_VendorFlaggedDriveWithNoEstimateIsStillReported(t *testing.T) {
+	// The common SAS case, and the one place the vendor's boolean has to be able
+	// to produce a finding on its own: the firmware says the drive is failing and
+	// never populated a life estimate, so there is no series to walk and nothing
+	// of ours to disagree with. A drive nobody can trend is not a drive that is
+	// fine.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	tele := []collect.HostTelemetry{{
+		Host:              "node-1",
+		CollectedAt:       start,
+		CorrectableErrors: map[string]float64{"DIMM_A1": 0},
+		FailurePredicted:  map[string]bool{"Bay 7": true},
+	}}
+	h.append(tele)
+
+	report := h.analyze(tele)
+
+	var found *analyze.Finding
+	for i := range report.Findings {
+		if report.Findings[i].Kind == "drive.vendor-failure-predicted" {
+			found = &report.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("a flagged drive with no life estimate produced nothing: %+v", report.Findings)
+	}
+	if found.Component != "Bay 7" {
+		t.Errorf("component = %q, want Bay 7", found.Component)
+	}
+
+	// And it reaches the exporter, so the flag can be alerted on directly.
+	if len(report.DriveTrends) != 1 {
+		t.Fatalf("got %d drive trends, want 1", len(report.DriveTrends))
+	}
+	if !report.DriveTrends[0].Trend.VendorFailurePredicted {
+		t.Error("the flag did not reach the exported trend")
+	}
+	if report.DriveTrends[0].Trend.Samples != 0 {
+		t.Errorf("samples = %d, want 0 — there was no estimate to trend", report.DriveTrends[0].Trend.Samples)
+	}
+}
+
+func TestHistory_VendorFlagDoesNotDuplicateATrendedDrive(t *testing.T) {
+	// One drive, one row, even though the flag arrives by a different route from
+	// the series. A bay that is both trended and flagged must produce exactly one
+	// finding, with the agreement inside it.
+	h := newHistory()
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 336; i++ {
+		h.append([]collect.HostTelemetry{{
+			Host:             "node-1",
+			CollectedAt:      start.Add(time.Duration(i) * time.Hour),
+			MediaLifeLeft:    map[string]float64{"Bay 1": float64(int(95 - float64(i)/24))},
+			FailurePredicted: map[string]bool{"Bay 1": true},
+		}})
+	}
+	tele := []collect.HostTelemetry{{
+		Host:             "node-1",
+		CollectedAt:      start.Add(335 * time.Hour),
+		MediaLifeLeft:    map[string]float64{"Bay 1": 81},
+		FailurePredicted: map[string]bool{"Bay 1": true},
+	}}
+
+	report := h.analyze(tele)
+
+	var drive []analyze.Finding
+	for _, f := range report.Findings {
+		if f.Component == "Bay 1" {
+			drive = append(drive, f)
+		}
+	}
+	if len(drive) != 1 {
+		t.Fatalf("got %d findings for one bay, want 1: %+v", len(drive), drive)
+	}
+	if drive[0].Kind != "drive.wearing" {
+		t.Errorf("kind = %q, want drive.wearing", drive[0].Kind)
+	}
+	if len(report.DriveTrends) != 1 {
+		t.Errorf("got %d drive trends for one bay, want 1", len(report.DriveTrends))
+	}
+}
